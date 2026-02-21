@@ -44,18 +44,20 @@ BASE_HRRR_FLAGS = {
     "lev_10_m_above_ground": "on",
     "lev_925_mb": "on",
     "lev_850_mb": "on",
-    # variables
+
+    # core variables (safe starter set)
     "var_UGRD": "on",
     "var_VGRD": "on",
     "var_GUST": "on",
     "var_PRMSL": "on",
-    "var_MSLET": "on",
     "var_HGT": "on",
-    # optional
-    "var_CAPE": "on",
-    "var_CIN": "on",
-    "var_LFTX": "on",
-    "var_HPBL": "on",
+
+    # Leave these OFF for now until we inspect inventory and add carefully:
+    # "var_MSLET": "on",
+    # "var_CAPE": "on",
+    # "var_CIN": "on",
+    # "var_LFTX": "on",
+    # "var_HPBL": "on",
 }
 
 
