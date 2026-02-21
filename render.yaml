@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: nomads-wrapper
+    env: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /healthz
