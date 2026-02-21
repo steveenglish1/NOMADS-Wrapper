@@ -38,18 +38,12 @@ VAR_PATTERNS = {
 
 # Keep MVP subset compact: common wind + pressure + low-level flow + optional stability fields
 BASE_HRRR_FLAGS = {
-    # levels (surface-only MVP)
-    "lev_surface": "on",
-    "lev_mean_sea_level": "on",
+    # levels (surface file-safe MVP)
     "lev_10_m_above_ground": "on",
 
-    # core vars
+    # variables (minimal)
     "var_UGRD": "on",
     "var_VGRD": "on",
-    "var_GUST": "on",
-    "var_PRMSL": "on",
-    # If this causes issues, leave only PRMSL first:
-    "var_MSLET": "on",
 }
 
 
