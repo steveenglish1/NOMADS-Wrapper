@@ -11,62 +11,101 @@ import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="NOMADS HRRR GRIB2->JSON Wrapper", version="0.2.0")
+app = FastAPI(title="NOMADS HRRR GRIB2->JSON Wrapper", version="0.3.0")
 
 NOMADS_BASE = "https://nomads.ncep.noaa.gov"
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/nomads_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------- Field extraction patterns (wgrib2 inventory text) ----------
-# Keep these broad; fields not present simply return null.
+# Keep broad pattern variants; missing fields simply return null.
 VAR_PATTERNS: Dict[str, List[str]] = {
+    # Wind vectors / pressure
     "u10": [r":UGRD:10 m above ground:"],
     "v10": [r":VGRD:10 m above ground:"],
     "gust_10m": [r":GUST:surface:"],
-    "mslp": [r":PRMSL:mean sea level:", r":MSLET:mean sea level:"],
+    "mslp": [r":MSLET:mean sea level:", r":PRMSL:mean sea level:"],
+
+    # Pressure-level winds / heights / temps
     "u925": [r":UGRD:925 mb:"],
     "v925": [r":VGRD:925 mb:"],
     "u850": [r":UGRD:850 mb:"],
     "v850": [r":VGRD:850 mb:"],
     "z850": [r":HGT:850 mb:"],
+    "temp_850_k": [r":TMP:850 mb:"],
+
+    # Surface / boundary layer / stability
+    "temp_2m_k": [r":TMP:2 m above ground:"],
     "cape": [r":CAPE:"],
     "cin": [r":CIN:"],
     "lifted_index": [r":LFTX:", r":LFTX:surface:"],
     "pbl_height": [r":HPBL:"],
+
+    # Cloud cover (percent) - pattern variants are intentionally broad
+    "cloud_cover_total": [r":TCDC:entire atmosphere", r":TCDC:"],
+    "cloud_cover_low": [r":LCDC:low cloud layer", r":LCDC:"],
+    "cloud_cover_mid": [r":MCDC:middle cloud layer", r":MCDC:"],
+    "cloud_cover_high": [r":HCDC:high cloud layer", r":HCDC:"],
 }
 
 # ---------- HRRR bundle configs ----------
-# We intentionally split requests so one unsupported combo doesn't kill everything.
-# product file names:
-# - wrfsfcf: surface file
-# - wrfprsf: pressure-level file (best-effort; if unavailable, we continue)
+# Split into multiple requests so one unsupported var/level combo doesn't break everything.
+# surface_core is required; all others are best-effort optional.
 BUNDLE_CONFIGS: Dict[str, Dict[str, Any]] = {
     "surface_core": {
         "product": "wrfsfcf",
         "flags": {
-            "lev_surface": "on",               # for GUST
-            "lev_mean_sea_level": "on",        # for PRMSL/MSLET
-            "lev_10_m_above_ground": "on",     # for U/V 10m
+            "lev_10_m_above_ground": "on",
             "var_UGRD": "on",
             "var_VGRD": "on",
-            "var_GUST": "on",
-            "var_PRMSL": "on",
-            "var_MSLET": "on",  # if this causes trouble later, we'll disable it
         },
         "required_for_point": True,
     },
-    "surface_optional": {
+    "surface_diag": {
+        "product": "wrfsfcf",
+        "flags": {
+            "lev_surface": "on",
+            "lev_mean_sea_level": "on",
+            "lev_2_m_above_ground": "on",
+            "var_GUST": "on",
+            "var_MSLET": "on",
+            "var_TMP": "on",
+        },
+        "required_for_point": False,
+    },
+    "pbl": {
+        "product": "wrfsfcf",
+        "flags": {
+            "lev_surface": "on",
+            "var_HPBL": "on",
+        },
+        "required_for_point": False,
+    },
+    "clouds": {
+        "product": "wrfsfcf",
+        "flags": {
+            "lev_entire_atmosphere": "on",
+            "lev_low_cloud_layer": "on",
+            "lev_middle_cloud_layer": "on",
+            "lev_high_cloud_layer": "on",
+            "var_TCDC": "on",
+            "var_LCDC": "on",
+            "var_MCDC": "on",
+            "var_HCDC": "on",
+        },
+        "required_for_point": False,
+    },
+    "thermo_stability": {
         "product": "wrfsfcf",
         "flags": {
             "lev_surface": "on",
             "var_CAPE": "on",
             "var_CIN": "on",
             "var_LFTX": "on",
-            "var_HPBL": "on",
         },
         "required_for_point": False,
     },
-    "pressure": {
+    "pressure_low": {
         "product": "wrfprsf",
         "flags": {
             "lev_925_mb": "on",
@@ -74,28 +113,53 @@ BUNDLE_CONFIGS: Dict[str, Dict[str, Any]] = {
             "var_UGRD": "on",
             "var_VGRD": "on",
             "var_HGT": "on",
+            "var_TMP": "on",
         },
         "required_for_point": False,
     },
 }
 
+OPTIONAL_BUNDLE_ORDER = ["surface_diag", "pbl", "clouds", "thermo_stability", "pressure_low"]
+
 ALL_HOURLY_KEYS = [
     "time",
+
+    # raw / direct values
     "u10",
     "v10",
     "wind_speed_10m",
     "wind_dir_10m",
     "gust_10m",
     "mslp",
+
     "u925",
     "v925",
+    "wind_speed_925",
+    "wind_dir_925",
+
     "u850",
     "v850",
     "z850",
+
     "cape",
     "cin",
     "lifted_index",
     "pbl_height",
+
+    "cloud_cover_total",
+    "cloud_cover_low",
+    "cloud_cover_mid",
+    "cloud_cover_high",
+
+    "temp_2m_c",
+    "temp_850_c",
+    "temp_diff_2m_850_c",
+
+    # derived regime features
+    "surface_925_wind_diff",
+    "surface_925_dir_diff_deg",
+    "shear_0_1km_proxy_10m_925",
+    "mixing_efficiency_ratio_10m_to_925",
 ]
 
 
@@ -163,6 +227,19 @@ def parse_fhrs(fhrs: str) -> List[int]:
 def compute_meteorological_dir_deg(u: float, v: float) -> float:
     # Meteorological direction = where wind is FROM, clockwise from north
     return (270.0 - math.degrees(math.atan2(v, u))) % 360.0
+
+
+def angle_diff_deg(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None or b is None:
+        return None
+    d = (b - a + 180.0) % 360.0 - 180.0
+    return abs(d)
+
+
+def k_to_c(k: Optional[float]) -> Optional[float]:
+    if k is None:
+        return None
+    return k - 273.15
 
 
 def hrrr_file_name(cycle_hour: int, fhr: int, product: str) -> str:
@@ -330,27 +407,30 @@ def extract_fields(grib_file: Path, lat: float, lon: float) -> Dict[str, Optiona
                 break
         result[key] = value
 
-    # Derived 10m speed/dir if U/V present in this file
+    # Derived winds if vectors are present
     u10 = result.get("u10")
     v10 = result.get("v10")
     if u10 is not None and v10 is not None:
-        result["wind_speed_10m"] = math.hypot(u10, v10)
+        result["wind_speed_10m"] = math.hypot(u10, v10)  # m/s
         result["wind_dir_10m"] = compute_meteorological_dir_deg(u10, v10)
     else:
         result["wind_speed_10m"] = None
         result["wind_dir_10m"] = None
 
+    u925 = result.get("u925")
+    v925 = result.get("v925")
+    if u925 is not None and v925 is not None:
+        result["wind_speed_925"] = math.hypot(u925, v925)  # m/s
+        result["wind_dir_925"] = compute_meteorological_dir_deg(u925, v925)
+    else:
+        result["wind_speed_925"] = None
+        result["wind_dir_925"] = None
+
     return result
 
 
 def init_hourly_dict() -> Dict[str, List[Optional[float]]]:
-    hourly: Dict[str, List[Optional[float]]] = {}
-    for k in ALL_HOURLY_KEYS:
-        if k == "time":
-            hourly[k] = []  # type: ignore
-        else:
-            hourly[k] = []
-    return hourly
+    return {k: [] for k in ALL_HOURLY_KEYS}
 
 
 def merge_non_null(target: Dict[str, Optional[float]], src: Dict[str, Optional[float]]) -> None:
@@ -384,6 +464,12 @@ def cycle_candidate_dts(start_dt: datetime, max_back_cycles: int) -> List[dateti
     return [start_dt - timedelta(hours=i) for i in range(max_back_cycles + 1)]
 
 
+def _invalid_parameter_in_body(body: Optional[str]) -> bool:
+    if not body:
+        return False
+    return "invalid parameter:" in body.lower()
+
+
 def resolve_cycle_for_required_surface_core(
     lat: float,
     lon: float,
@@ -410,9 +496,24 @@ def resolve_cycle_for_required_surface_core(
             try:
                 download_with_cache(url, force_refresh=force_refresh)
             except NomadsDownloadError as e:
+                # Fail fast if the request itself is invalid (config bug), not a cycle availability issue.
+                if _invalid_parameter_in_body(e.body_preview):
+                    raise HTTPException(
+                        status_code=500,
+                        detail={
+                            "error": "Invalid NOMADS parameter in required surface_core bundle",
+                            "bundle": "surface_core",
+                            "cycle_tested": f"{cycle_date}{cycle_hour:02d}",
+                            "fhr": fhr,
+                            "nomads_url": e.url,
+                            "status_code": e.status_code,
+                            "content_type": e.content_type,
+                            "body_preview": e.body_preview,
+                        },
+                    )
+
                 candidate_ok = False
                 msg = f"cycle {cycle_date}{cycle_hour:02d} f{fhr:02d} surface_core unavailable: {e.short()}"
-                # Include brief body clue when useful (e.g., file not present)
                 if e.body_preview:
                     snippet = re.sub(r"\s+", " ", e.body_preview)[:220]
                     msg += f" | body={snippet}"
@@ -427,7 +528,7 @@ def resolve_cycle_for_required_surface_core(
                 )
             return candidate_dt, warnings
 
-        last_errors.extend(candidate_errors[-2:])  # keep short trail
+        last_errors.extend(candidate_errors[-2:])
 
     detail = {
         "error": "Unable to find a usable HRRR surface_core cycle for requested forecast hours",
@@ -483,14 +584,15 @@ def debug_hrrr_inventory(
     lon: float = Query(..., ge=-180, le=180),
     fhr: int = Query(1, ge=0, le=48),
     run_utc: Optional[str] = Query(None, description="YYYYMMDDHH or ISO8601 Z"),
-    bundle: str = Query("surface_core", pattern="^(surface_core|surface_optional|pressure)$"),
+    bundle: str = Query(
+        "surface_core",
+        pattern="^(surface_core|surface_diag|pbl|clouds|thermo_stability|pressure_low)$",
+    ),
     force_refresh: bool = Query(False),
     max_back_cycles: int = Query(12, ge=0, le=48),
 ):
     start_dt = start_cycle_dt_from_query(run_utc)
 
-    # For debug, if user omitted run_utc, allow fallback to find a real file.
-    # If user provided run_utc, we still allow fallback by default (Option A convenience).
     selected_dt, fallback_warnings = resolve_cycle_for_required_surface_core(
         lat,
         lon,
@@ -500,8 +602,6 @@ def debug_hrrr_inventory(
         max_back_cycles=max_back_cycles,
     )
 
-    # If they asked for a non-surface bundle, try that bundle on the selected cycle;
-    # if it fails, return a structured 502 with details instead of generic 500.
     cycle_date, cycle_hour = cycle_dt_to_parts(selected_dt)
     url = build_bundle_url(bundle, lat, lon, cycle_date, cycle_hour, fhr)
 
@@ -559,7 +659,6 @@ def hrrr_point(
 
     start_dt = start_cycle_dt_from_query(run_utc)
 
-    # Find a cycle where required surface_core files exist for all requested hours.
     selected_dt, warnings = resolve_cycle_for_required_surface_core(
         lat,
         lon,
@@ -573,21 +672,17 @@ def hrrr_point(
 
     hourly = init_hourly_dict()
 
-    debug_urls: Dict[str, List[str]] = {
-        "surface_core": [],
-        "surface_optional": [],
-        "pressure": [],
-    }
+    debug_urls: Dict[str, List[str]] = {"surface_core": []}
+    for b in OPTIONAL_BUNDLE_ORDER:
+        debug_urls[b] = []
 
-    # If an optional bundle repeatedly fails due unsupported product/fields, we can suppress retries.
     optional_bundle_disabled_reason: Dict[str, str] = {}
 
-    for fhr in fh_list:
+    for idx, fhr in enumerate(fh_list):
         merged_fields: Dict[str, Optional[float]] = {
+            # raw/direct
             "u10": None,
             "v10": None,
-            "wind_speed_10m": None,
-            "wind_dir_10m": None,
             "gust_10m": None,
             "mslp": None,
             "u925": None,
@@ -599,9 +694,20 @@ def hrrr_point(
             "cin": None,
             "lifted_index": None,
             "pbl_height": None,
+            "cloud_cover_total": None,
+            "cloud_cover_low": None,
+            "cloud_cover_mid": None,
+            "cloud_cover_high": None,
+            "temp_2m_k": None,
+            "temp_850_k": None,
+            # extracted derived from bundle-level extract_fields
+            "wind_speed_10m": None,
+            "wind_dir_10m": None,
+            "wind_speed_925": None,
+            "wind_dir_925": None,
         }
 
-        # 1) surface_core (required)
+        # 1) required surface core
         try:
             fields, url = fetch_bundle_fields_for_hour(
                 "surface_core", lat, lon, cycle_date, cycle_hour, fhr, force_refresh=force_refresh
@@ -610,7 +716,6 @@ def hrrr_point(
             if fields:
                 merge_non_null(merged_fields, fields)
         except NomadsDownloadError as e:
-            # This should be rare after cycle selection, but if it happens we fail loudly.
             raise HTTPException(
                 status_code=502,
                 detail={
@@ -626,68 +731,83 @@ def hrrr_point(
                 },
             )
 
-        # 2) surface_optional (best-effort)
-        if "surface_optional" not in optional_bundle_disabled_reason:
+        # 2) optional bundles (best-effort)
+        for bundle_name in OPTIONAL_BUNDLE_ORDER:
+            if bundle_name in optional_bundle_disabled_reason:
+                if idx == 0:
+                    warnings.append(
+                        f"Bundle {bundle_name} disabled for remaining hours: "
+                        f"{optional_bundle_disabled_reason[bundle_name]}"
+                    )
+                continue
+
             try:
                 fields, url = fetch_bundle_fields_for_hour(
-                    "surface_optional", lat, lon, cycle_date, cycle_hour, fhr, force_refresh=force_refresh
+                    bundle_name, lat, lon, cycle_date, cycle_hour, fhr, force_refresh=force_refresh
                 )
-                debug_urls["surface_optional"].append(url)
+                debug_urls[bundle_name].append(url)
                 if fields:
                     merge_non_null(merged_fields, fields)
             except NomadsDownloadError as e:
-                warnings.append(summarize_nomads_error_for_warning("surface_optional", fhr, e))
-                # If this is clearly an unsupported/invalid bundle request on NOMADS, suppress future retries.
-                if e.status_code in (400, 404, 500):
-                    optional_bundle_disabled_reason["surface_optional"] = warnings[-1]
+                warn = summarize_nomads_error_for_warning(bundle_name, fhr, e)
+                warnings.append(warn)
+                # If clearly invalid/unsupported, stop retrying this optional bundle for remaining hours
+                if e.status_code in (400, 404, 500) or _invalid_parameter_in_body(e.body_preview):
+                    optional_bundle_disabled_reason[bundle_name] = warn
             except HTTPException as e:
-                warnings.append(f"Bundle surface_optional f{fhr:02d} extraction skipped: {e.detail}")
-                optional_bundle_disabled_reason["surface_optional"] = warnings[-1]
-        elif fhr == fh_list[0]:
-            warnings.append(f"Bundle surface_optional disabled for remaining hours: {optional_bundle_disabled_reason['surface_optional']}")
+                warn = f"Bundle {bundle_name} f{fhr:02d} extraction skipped: {e.detail}"
+                warnings.append(warn)
+                optional_bundle_disabled_reason[bundle_name] = warn
 
-        # 3) pressure (best-effort, separate product wrfprsf)
-        if "pressure" not in optional_bundle_disabled_reason:
-            try:
-                fields, url = fetch_bundle_fields_for_hour(
-                    "pressure", lat, lon, cycle_date, cycle_hour, fhr, force_refresh=force_refresh
-                )
-                debug_urls["pressure"].append(url)
-                if fields:
-                    merge_non_null(merged_fields, fields)
-            except NomadsDownloadError as e:
-                warnings.append(summarize_nomads_error_for_warning("pressure", fhr, e))
-                if e.status_code in (400, 404, 500):
-                    optional_bundle_disabled_reason["pressure"] = warnings[-1]
-            except HTTPException as e:
-                warnings.append(f"Bundle pressure f{fhr:02d} extraction skipped: {e.detail}")
-                optional_bundle_disabled_reason["pressure"] = warnings[-1]
-        elif fhr == fh_list[0]:
-            warnings.append(f"Bundle pressure disabled for remaining hours: {optional_bundle_disabled_reason['pressure']}")
-
-        # Final derived 10m speed/dir from merged U/V
+        # Final derived winds from merged vectors (m/s)
         u10 = merged_fields.get("u10")
         v10 = merged_fields.get("v10")
-        if u10 is not None and v10 is not None:
-            ws_si = math.hypot(u10, v10)
-            wd = compute_meteorological_dir_deg(u10, v10)
-        else:
-            ws_si = None
-            wd = None
+        u925 = merged_fields.get("u925")
+        v925 = merged_fields.get("v925")
+
+        ws10_si = math.hypot(u10, v10) if (u10 is not None and v10 is not None) else None
+        wd10 = compute_meteorological_dir_deg(u10, v10) if (u10 is not None and v10 is not None) else None
+
+        ws925_si = math.hypot(u925, v925) if (u925 is not None and v925 is not None) else None
+        wd925 = compute_meteorological_dir_deg(u925, v925) if (u925 is not None and v925 is not None) else None
 
         gust_si = merged_fields.get("gust_10m")
 
-        valid_dt = run_dt + timedelta(hours=fhr)
-        hourly["time"].append(valid_dt.isoformat().replace("+00:00", "Z"))  # type: ignore
+        # Regime-derived metrics
+        surface_925_vec_diff_si = None
+        if None not in (u10, v10, u925, v925):
+            assert u10 is not None and v10 is not None and u925 is not None and v925 is not None
+            surface_925_vec_diff_si = math.hypot(u925 - u10, v925 - v10)
 
-        hourly["u10"].append(merged_fields.get("u10"))
-        hourly["v10"].append(merged_fields.get("v10"))
-        hourly["u925"].append(merged_fields.get("u925"))
-        hourly["v925"].append(merged_fields.get("v925"))
+        surface_925_dir_diff_deg = angle_diff_deg(wd10, wd925)
+
+        # Proxy for 0–1km shear: use 10m vs 925mb vector diff (m/s)
+        shear_0_1km_proxy_si = surface_925_vec_diff_si
+
+        mixing_efficiency_ratio = None
+        if ws10_si is not None and ws925_si is not None and ws925_si > 0:
+            mixing_efficiency_ratio = ws10_si / ws925_si
+
+        temp_2m_c = k_to_c(merged_fields.get("temp_2m_k"))
+        temp_850_c = k_to_c(merged_fields.get("temp_850_k"))
+        temp_diff_2m_850_c = None
+        if temp_2m_c is not None and temp_850_c is not None:
+            temp_diff_2m_850_c = temp_2m_c - temp_850_c
+
+        valid_dt = run_dt + timedelta(hours=fhr)
+        hourly["time"].append(valid_dt.isoformat().replace("+00:00", "Z"))
+
+        # Raw vectors (keep SI)
+        hourly["u10"].append(u10)
+        hourly["v10"].append(v10)
+        hourly["u925"].append(u925)
+        hourly["v925"].append(v925)
         hourly["u850"].append(merged_fields.get("u850"))
         hourly["v850"].append(merged_fields.get("v850"))
 
-        hourly["wind_dir_10m"].append(wd)
+        # Directions / non-speed scalars
+        hourly["wind_dir_10m"].append(wd10)
+        hourly["wind_dir_925"].append(wd925)
         hourly["mslp"].append(merged_fields.get("mslp"))
         hourly["z850"].append(merged_fields.get("z850"))
         hourly["cape"].append(merged_fields.get("cape"))
@@ -695,12 +815,32 @@ def hrrr_point(
         hourly["lifted_index"].append(merged_fields.get("lifted_index"))
         hourly["pbl_height"].append(merged_fields.get("pbl_height"))
 
+        hourly["cloud_cover_total"].append(merged_fields.get("cloud_cover_total"))
+        hourly["cloud_cover_low"].append(merged_fields.get("cloud_cover_low"))
+        hourly["cloud_cover_mid"].append(merged_fields.get("cloud_cover_mid"))
+        hourly["cloud_cover_high"].append(merged_fields.get("cloud_cover_high"))
+
+        hourly["temp_2m_c"].append(temp_2m_c)
+        hourly["temp_850_c"].append(temp_850_c)
+        hourly["temp_diff_2m_850_c"].append(temp_diff_2m_850_c)
+
+        # Speed-like values (respect units query)
         if units == "knots":
-            hourly["wind_speed_10m"].append(ws_si * 1.943844492 if ws_si is not None else None)
-            hourly["gust_10m"].append(gust_si * 1.943844492 if gust_si is not None else None)
+            conv = 1.943844492
+            hourly["wind_speed_10m"].append(ws10_si * conv if ws10_si is not None else None)
+            hourly["gust_10m"].append(gust_si * conv if gust_si is not None else None)
+            hourly["wind_speed_925"].append(ws925_si * conv if ws925_si is not None else None)
+            hourly["surface_925_wind_diff"].append(surface_925_vec_diff_si * conv if surface_925_vec_diff_si is not None else None)
+            hourly["shear_0_1km_proxy_10m_925"].append(shear_0_1km_proxy_si * conv if shear_0_1km_proxy_si is not None else None)
         else:
-            hourly["wind_speed_10m"].append(ws_si)
+            hourly["wind_speed_10m"].append(ws10_si)
             hourly["gust_10m"].append(gust_si)
+            hourly["wind_speed_925"].append(ws925_si)
+            hourly["surface_925_wind_diff"].append(surface_925_vec_diff_si)
+            hourly["shear_0_1km_proxy_10m_925"].append(shear_0_1km_proxy_si)
+
+        hourly["surface_925_dir_diff_deg"].append(surface_925_dir_diff_deg)
+        hourly["mixing_efficiency_ratio_10m_to_925"].append(mixing_efficiency_ratio)
 
     response = {
         "meta": {
@@ -710,15 +850,20 @@ def hrrr_point(
             "run_utc_selected": f"{cycle_date}{cycle_hour:02d}",
             "cycle_hour": cycle_hour,
             "units": units,
-            "bundle_strategy": {
-                "surface_core": {"product": "wrfsfcf", "required": True},
-                "surface_optional": {"product": "wrfsfcf", "required": False},
-                "pressure": {"product": "wrfprsf", "required": False},
-            },
+            "bundle_strategy": {k: {"product": v["product"], "required": v["required_for_point"]} for k, v in BUNDLE_CONFIGS.items()},
+            "derived_features": [
+                "surface_925_wind_diff (vector magnitude difference; same speed units as output)",
+                "shear_0_1km_proxy_10m_925 (proxy using 10m vs 925mb vector difference)",
+                "mixing_efficiency_ratio_10m_to_925 (10m speed / 925mb speed)",
+                "temp_diff_2m_850_c (2mC - 850mbC)",
+                "surface_925_dir_diff_deg (absolute direction difference)",
+            ],
             "notes": [
                 "GRIB2 decoded with wgrib2 nearest-gridpoint extraction.",
                 "Wrapper uses multi-bundle best-effort fetches and merges fields.",
                 "Optional bundles may be skipped if NOMADS rejects the request or product/fields are unavailable.",
+                "Temperature outputs are converted from Kelvin to Celsius when available.",
+                "0–1 km shear is currently a proxy using 10m vs 925mb wind vector difference.",
             ],
         },
         "location": {"lat": lat, "lon": lon},
