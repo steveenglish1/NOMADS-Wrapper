@@ -11,14 +11,14 @@ import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="NOMADS HRRR GRIB2->JSON Wrapper", version="0.1.0")
+app = FastAPI(title="NOMADS HRRR GRIB2->JSON Wrapper", version="0.1.1")
 
 NOMADS_BASE = "https://nomads.ncep.noaa.gov"
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/nomads_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Regex patterns against wgrib2 inventory (-s) text.
-# You can tune these after checking /debug/hrrr_inventory.
+# Keep the broader set here; missing fields will just return null if not requested.
 VAR_PATTERNS = {
     "u10": [r":UGRD:10 m above ground:"],
     "v10": [r":VGRD:10 m above ground:"],
@@ -29,19 +29,16 @@ VAR_PATTERNS = {
     "u850": [r":UGRD:850 mb:"],
     "v850": [r":VGRD:850 mb:"],
     "z850": [r":HGT:850 mb:"],
-    # Optional; may need tuning based on actual HRRR inventory
     "cape": [r":CAPE:"],
     "cin": [r":CIN:"],
     "lifted_index": [r":LFTX:", r":LFTX:surface:"],
     "pbl_height": [r":HPBL:"],
 }
 
-# Keep MVP subset compact: common wind + pressure + low-level flow + optional stability fields
+# SAFE MINIMAL MVP request: only 10m U/V from the HRRR surface file.
+# This avoids NOMADS CGI 500s caused by invalid variable/level combos on wrfsfcf files.
 BASE_HRRR_FLAGS = {
-    # levels (surface file-safe MVP)
     "lev_10_m_above_ground": "on",
-
-    # variables (minimal)
     "var_UGRD": "on",
     "var_VGRD": "on",
 }
@@ -94,8 +91,15 @@ def hrrr_dir(date_yyyymmdd: str) -> str:
     return f"/hrrr.{date_yyyymmdd}/conus"
 
 
-def nomads_hrrr_url(lat: float, lon: float, cycle_date: str, cycle_hour: int, fhr: int, bbox_deg: float = 0.12) -> str:
-    # Small bbox around point reduces download size; wgrib2 still extracts nearest gridpoint
+def nomads_hrrr_url(
+    lat: float,
+    lon: float,
+    cycle_date: str,
+    cycle_hour: int,
+    fhr: int,
+    bbox_deg: float = 0.12,
+) -> str:
+    # Small bbox around point reduces download size; wgrib2 extracts nearest gridpoint
     leftlon = lon - bbox_deg
     rightlon = lon + bbox_deg
     bottomlat = lat - bbox_deg
@@ -122,27 +126,56 @@ def cache_path_for_url(url: str) -> Path:
 
 
 def download_with_cache(url: str, force_refresh: bool = False) -> Path:
+    """
+    Download NOMADS subset response and cache it. Raises readable HTTPException(502)
+    with NOMADS response details instead of generic 500s.
+    """
     dest = cache_path_for_url(url)
     if dest.exists() and not force_refresh and dest.stat().st_size > 0:
         return dest
 
     tmp = dest.with_suffix(".tmp")
-    with requests.get(url, stream=True, timeout=(10, 90)) as r:
-        r.raise_for_status()
-        ctype = (r.headers.get("content-type") or "").lower()
-        if "text/html" in ctype:
-            body = r.text[:1200]
-            raise HTTPException(status_code=502, detail=f"NOMADS returned HTML error page: {body}")
 
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 64):
-                if chunk:
-                    f.write(chunk)
+    try:
+        with requests.get(url, stream=True, timeout=(10, 90)) as r:
+            status = r.status_code
+            ctype = (r.headers.get("content-type") or "").lower()
+
+            if status != 200:
+                # Try to capture text payload for debugging
+                try:
+                    body_preview = r.text[:1200]
+                except Exception:
+                    body_preview = "<unable to read response body>"
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"NOMADS HTTP {status}. content-type={ctype}. body={body_preview}",
+                )
+
+            # NOMADS errors often come back as text/html or text/plain instead of GRIB2
+            if "text/html" in ctype or "text/plain" in ctype:
+                try:
+                    body_preview = r.text[:1200]
+                except Exception:
+                    body_preview = "<unable to read response body>"
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"NOMADS returned non-GRIB response. content-type={ctype}. body={body_preview}",
+                )
+
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 64):
+                    if chunk:
+                        f.write(chunk)
+
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"NOMADS request failed: {type(e).__name__}: {e}")
 
     tmp.replace(dest)
 
-    if dest.stat().st_size == 0:
+    if not dest.exists() or dest.stat().st_size == 0:
         raise HTTPException(status_code=502, detail="Downloaded GRIB2 file was empty")
+
     return dest
 
 
@@ -295,7 +328,7 @@ def hrrr_point(
         valid_dt = run_dt + timedelta(hours=fhr)
         hourly["time"].append(valid_dt.isoformat().replace("+00:00", "Z"))
 
-        # Vector components remain SI (m/s) in this MVP
+        # Vector components (m/s)
         hourly["u10"].append(fields.get("u10"))
         hourly["v10"].append(fields.get("v10"))
         hourly["u925"].append(fields.get("u925"))
@@ -331,7 +364,8 @@ def hrrr_point(
             "units": units,
             "notes": [
                 "GRIB2 decoded with wgrib2 nearest-gridpoint extraction.",
-                "Some optional fields may return null until VAR_PATTERNS are tuned using /debug/hrrr_inventory."
+                "This build requests only 10m U/V from HRRR wrfsfcf for bring-up/testing.",
+                "Optional fields may be null until additional NOMADS requests/products are added."
             ],
         },
         "location": {"lat": lat, "lon": lon},
